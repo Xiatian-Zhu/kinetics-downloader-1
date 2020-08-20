@@ -3,9 +3,15 @@ import argparse
 import os
 import shutil
 import subprocess
-import pytube
 from joblib import delayed
 from joblib import Parallel
+import youtube_dl
+
+from stem import Signal
+from stem.control import Controller
+import requests
+
+import json
 
 REQUIRED_COLUMNS = ['label', 'youtube_id', 'time_start', 'time_end', 'split', 'is_cc']
 TRIM_FORMAT = '%06d'
@@ -27,85 +33,87 @@ def create_file_structure(path, folders_names):
         os.mkdir(path)
     for name in folders_names:
         dir_ = os.path.join(path, name)
+        dir_ = dir_.replace(' ', '_')
         if not os.path.exists(dir_):
             os.mkdir(dir_)
         mapping[name] = dir_
+        print(dir_)
     return mapping
 
+def test_proxy(config):
+    print('----------------------------------------------')
+    print('Running Proxy Test')
+    print('Your IP:')
+    ip_test = requests.get('http://httpbin.org/ip').json()
+    print(requests.get('http://httpbin.org/ip').json())
+    renew_connection(config['tor_password'])
+    print('Tor IP:')
+    tor_ip_test = requests.Session().get('http://httpbin.org/ip',
+                                         proxies={'http': 'socks5://127.0.0.1:9050'}).json()
+    print(tor_ip_test)
+    test_result = False
+    if ip_test != tor_ip_test:
+        print('Tor IP working correctly')
+        test_result = True
+    else:
+        print('Your IP and Tor IP are the same: check you are running tor from commandline')
 
-def download_clip(row, label_to_dir, trim, count):
-    """
-    Download clip from youtube.
-    row: dict-like objects with keys: ['label', 'youtube_id', 'time_start', 'time_end']
-    'time_start' and 'time_end' matter if trim is True
-    trim: bool, trim video to action ot not
-    """
+    return test_result
+
+
+def renew_connection(tor_password):
+    print(tor_password)
+    with Controller.from_port(port=9051) as controller:
+        controller.authenticate(password=tor_password)
+        controller.signal(Signal.NEWNYM)
+
+
+def download_video(config, row, label_to_dir, trim, count):
+    print('New Tor IP Adddress Allocated')
+    renew_connection(config['tor_password'])
 
     label = row['label']
-    filename = row['youtube_id']
-    time_start = row['time_start']
-    time_end = row['time_end']
+    videoId = row['youtube_id']
+    # time_start = row['time_start']
+    # time_end = row['time_end']
 
     # if trim, save full video to tmp folder
     output_path = label_to_dir['tmp'] if trim else label_to_dir[label]
+    if not os.path.exists(os.path.join(output_path, videoId + VIDEO_EXTENSION)):
+        print('===========================')
+        print('Start downloading: ', videoId)
+        print('===========================')
 
-    # don't download if already exists
-    if not os.path.exists(os.path.join(output_path, filename + VIDEO_EXTENSION)):
-        print('Start downloading: ', filename)
-        try:
-            pytube.YouTube(URL_BASE + filename).\
-                streams.filter(subtype=VIDEO_FORMAT).first().\
-                download(output_path, filename)
-            print('Finish downloading: ', filename)
-        except KeyError:
-            print('Unavailable video: ', filename)
-            return
-#         uncomment, if you want to skip any error:
-#
-#         except:
-#             print('Don\'t know why something went wrong(')
-#             return
+        ydl = youtube_dl.YoutubeDL({
+            # 'outtmpl': os.path.dirname(os.path.realpath(__file__)) + '/videos/' + '%(id)s.%(ext)s',
+            'outtmpl': output_path + '/' + '%(id)s.%(ext)s',
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'proxy': 'socks5://127.0.0.1:9050',
+            'verbose': config['verbose_logging'],
+            'nocheckcertificate': True,
+            # 'postprocessors': '-ss 649.044 -t 3.0'
+        })
+
+        with ydl:
+            # handle looping over files
+            result = ydl.extract_info(
+                f'http://www.youtube.com/watch?v={videoId}',
+                download=True
+            )
     else:
-        print('Already downloaded: ', filename)
+        print('Already downloaded: ', videoId)
 
-    if trim:
-        # Take video from tmp folder and put trimmed to final destination folder
-        # better write full path to video
-
-        start = str(time_start)
-        end = str(time_end - time_start)
-
-        input_filename = os.path.join(output_path, filename + VIDEO_EXTENSION)
-        output_filename = os.path.join(label_to_dir[label],
-                                       filename + '_{}_{}'.format(start, end) + VIDEO_EXTENSION)
-
-        if os.path.exists(output_filename):
-            print('Already trimmed: ', filename)
-        else:
-            print('Start trimming: ', filename)
-            # Construct command to trim the videos (ffmpeg required).
-            command = 'ffmpeg -i "{input_filename}" ' \
-                      '-ss {time_start} ' \
-                      '-t {time_end} ' \
-                      '-c:v libx264 -c:a copy -threads 1 ' \
-                      '"{output_filename}"'.format(
-                           input_filename=input_filename,
-                           time_start=start,
-                           time_end=end,
-                           output_filename=output_filename
-                       )
-            try:
-                subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT)
-            except subprocess.CalledProcessError:
-                print('Error while trimming: ', filename)
-                return False
-            print('Finish trimming: ', filename)
-
-    print('Processed %i out of %i' % (count + 1, TOTAL_VIDEOS))
+    print('o==> Processed %i out of %i' % (count + 1, TOTAL_VIDEOS))
 
 
 def main(input_csv, output_dir, trim, num_jobs):
     global TOTAL_VIDEOS
+
+    # read config and test Tor
+    config_file = open('config.json', 'r')
+    config = json.load(config_file)
+
+    test_proxy(config)
 
     assert input_csv[-4:] == '.csv', 'Provided input is not a .csv file'
     links_df = pd.read_csv(input_csv)
@@ -117,11 +125,12 @@ def main(input_csv, output_dir, trim, num_jobs):
     folders_names = links_df['label'].unique().tolist() + ['tmp']
     label_to_dir = create_file_structure(path=output_dir,
                                          folders_names=folders_names)
-
+    
     TOTAL_VIDEOS = links_df.shape[0]
+    print(f'\n\no====> Total videos {TOTAL_VIDEOS}, num-ojbs: {num_jobs}\n\n')
     # Download files by links from dataframe
-    Parallel(n_jobs=num_jobs)(delayed(download_clip)(
-            row, label_to_dir, trim, count) for count, row in links_df.iterrows())
+    Parallel(n_jobs=num_jobs)(delayed(download_video)(
+            config, row, label_to_dir, trim, count) for count, row in links_df.iterrows())
 
     # Clean tmp directory
     shutil.rmtree(label_to_dir['tmp'])
@@ -143,4 +152,5 @@ if __name__ == '__main__':
                         'Requires "ffmpeg" installed and added to environment PATH')
     p.add_argument('--num-jobs', type=int, default=1,
                    help='Number of parallel processes for downloading and trimming.')
+    
     main(**vars(p.parse_args()))
